@@ -1,0 +1,40 @@
+{
+  "device": "NVIDIA H20-3e",
+  "sm": "sm_90",
+  "sms": 78,
+  "l2_mb": 60.0,
+  "memory_gb": 139.7,
+  "tflops": {
+    "fp16": 141.0,
+    "bf16": 138.6,
+    "fp32": 25.7,
+    "tf32": 69.7,
+    "fp8": 278.5
+  },
+  "bw_copy_gbs": 2249,
+  "bw_read_gbs": 2615,
+  "bw_write_gbs": 3380,
+  "ridge_flop_per_byte": {
+    "fp16": 53.9,
+    "bf16": 53.0,
+    "fp32": 9.8,
+    "tf32": 26.6,
+    "fp8": 106.5
+  },
+  "default_half_dtype": "bf16",
+  "features": {
+    "bf16_tensor_cores": true,
+    "tf32": true,
+    "fp8": true,
+    "hopper_wgmma_tma": true
+  },
+  "smem_per_block_kb": 227,
+  "regs_per_sm": 65536,
+  "sm_clock_mhz": 1980,
+  "triton": "3.2.0",
+  "launch_us_triton": 18.7,
+  "launch_us_torch": 4.7,
+  "launch_us_graph_replay": 11.2,
+  "ncu": "unavailable: /usr/local/cuda/bin/ncu has no counter permission (ERR_NVGPUCTRPERM). Host fix: driver option NVreg_RestrictProfilingToAdminUsers=0, or run the container with --cap-add SYS_ADMIN",
+  "torch": "2.6.0+cu124"
+}

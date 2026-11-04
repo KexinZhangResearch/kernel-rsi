@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Captured regions: real weights and activations (large, and may be private model data)
+*.pt
+*.pth
+*.safetensors
+
+# Working directories created while optimizing a model
+work/
+krsi_work/
+
+# Profiler output
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+
+# Triton cache, editors, OS
+.triton/
+.vscode/
+.idea/
+.DS_Store
