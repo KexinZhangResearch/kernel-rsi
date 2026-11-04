@@ -1,0 +1,65 @@
+{
+  "versions": {
+    "device": "NVIDIA H20-3e",
+    "torch": "2.6.0+cu124",
+    "cuda": "12.4",
+    "triton": "3.2.0"
+  },
+  "library": {
+    "geglu": {
+      "pass": true,
+      "device": "NVIDIA H20-3e",
+      "torch": "2.6.0+cu124",
+      "cuda": "12.4",
+      "triton": "3.2.0",
+      "reference_us": 170.0,
+      "kernel_us": 43.7,
+      "speedup": 3.89,
+      "significance": "faster",
+      "compiled": {
+        "pass": true,
+        "kernel_us": 43.4,
+        "reference_us": 81.3,
+        "speedup": 1.87,
+        "significance": "faster"
+      }
+    },
+    "relpos_attention": {
+      "pass": true,
+      "device": "NVIDIA H20-3e",
+      "torch": "2.6.0+cu124",
+      "cuda": "12.4",
+      "triton": "3.2.0",
+      "reference_us": 2245.4,
+      "kernel_us": 415.9,
+      "speedup": 5.4,
+      "significance": "faster",
+      "compiled": {
+        "pass": true,
+        "kernel_us": 329.8,
+        "reference_us": 882.6,
+        "speedup": 2.68,
+        "significance": "faster"
+      }
+    },
+    "rmsnorm": {
+      "pass": true,
+      "device": "NVIDIA H20-3e",
+      "torch": "2.6.0+cu124",
+      "cuda": "12.4",
+      "triton": "3.2.0",
+      "reference_us": 279.5,
+      "kernel_us": 39.6,
+      "speedup": 7.06,
+      "significance": "faster",
+      "compiled": {
+        "pass": true,
+        "kernel_us": 34.4,
+        "reference_us": 47.6,
+        "speedup": 1.38,
+        "significance": "faster"
+      }
+    }
+  },
+  "regions": {}
+}

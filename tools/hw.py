@@ -126,6 +126,14 @@ def main() -> None:
             del a, b
         except Exception:  # noqa: BLE001 - fp8 GEMM API differs across torch versions
             pass
+    # Skinny GEMMs (small M, e.g. decode or small batches) never reach the square-GEMM peak.
+    half_dt = torch.bfloat16 if cap >= (8, 0) else torch.float16
+    skinny = {}
+    for m_ in (16, 64, 256, 1024):
+        a = torch.randn(m_, 4096, device="cuda", dtype=half_dt)
+        b = torch.randn(4096, 4096, device="cuda", dtype=half_dt)
+        skinny[f"M{m_}xN4096xK4096"] = round(2 * m_ * 4096 * 4096 / best_ms(lambda: a @ b, iters=50) / 1e9, 1)
+    tflops["skinny_" + ("bf16" if cap >= (8, 0) else "fp16")] = skinny
     torch.cuda.empty_cache()
     numel = min(512 << 20, props.total_memory // 16)        # <= 1 GiB per fp16 buffer, <= 1/8 of memory
     src = torch.randn(numel, device="cuda", dtype=torch.float16)
@@ -144,7 +152,8 @@ def main() -> None:
             "l2_mb": round(getattr(props, "L2_cache_size", 0) / 2 ** 20, 1),
             "memory_gb": round(props.total_memory / 2 ** 30, 1), "tflops": tflops,
             "bw_copy_gbs": round(copy), "bw_read_gbs": round(read), "bw_write_gbs": round(write),
-            "ridge_flop_per_byte": {k: round(v * 1e12 / (bw * 1e9), 1) for k, v in tflops.items()},
+            "ridge_flop_per_byte": {k: round(v * 1e12 / (bw * 1e9), 1) for k, v in tflops.items()
+                                    if isinstance(v, (int, float))},
             "default_half_dtype": half, "features": features}
     try:
         import triton  # noqa: PLC0415

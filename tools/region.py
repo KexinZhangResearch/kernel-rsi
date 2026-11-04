@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch  # noqa: E402
 from torch.utils._pytree import tree_map  # noqa: E402
 
-from common import compute_dtype, hw_info, peaks, load_entry, nbytes, run_model, tensors, write_json  # noqa: E402
+from common import (effective_dtype, entry_autocast, autocast_ctx, autocast_state, compute_dtype, hw_info, is_train, load_entry,  # noqa: E402
+                    nbytes, peaks, run_model, set_train_mode, tensors, train_loss, write_json)
 from hotspots import ROOT, OpTracer  # noqa: E402
 
 IMPL_TEMPLATE = '''"""Replacement for {cls} ({qual}). Contract: compute the same function as the original forward.
@@ -66,6 +67,7 @@ def main() -> None:
     ap.add_argument("--entry", required=True)
     ap.add_argument("--module", required=True, help=f"qualname from hotspots.py ('{ROOT}' for the whole model)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--call", type=int, default=0, help="which call of the module to capture (0 = first)")
     a = ap.parse_args()
 
     entry_path = Path(a.entry).resolve()
@@ -76,31 +78,67 @@ def main() -> None:
         near = [q for q in mods if a.module in q][:10]
         raise SystemExit(f"no module '{a.module}'. Similar: {near}")
     target = mods[a.module]
-    seen = {}
+    train = is_train(entry)
+    dropout_off = set_train_mode(model) if train else []
+    if not train:
+        model.eval()
+    seen, grad_out = {}, {}
+    clone = lambda x: tree_map(lambda t: t.detach().clone() if isinstance(t, torch.Tensor) else t, x)  # noqa: E731
+
+    calls = []  # input shapes of every call, to show what a single capture does not cover
 
     def hook(m, args, kwargs, out):
-        if "args" not in seen:
-            seen.update(args=tree_map(lambda t: t.detach().clone() if isinstance(t, torch.Tensor) else t, args),
-                        kwargs=tree_map(lambda t: t.detach().clone() if isinstance(t, torch.Tensor) else t, kwargs),
-                        out=tree_map(lambda t: t.detach().clone() if isinstance(t, torch.Tensor) else t, out))
+        calls.append(tuple(tuple(t.shape) for t in tensors((args, kwargs))))
+        if "args" in seen or len(calls) - 1 != a.call:
+            return
+        seen.update(args=clone(args), kwargs=clone(kwargs), out=clone(out), autocast=autocast_state(),
+                    grad_idx=[i for i, t in enumerate(tensors((args, kwargs))) if t.requires_grad])
+        if train:  # capture the real upstream gradient arriving at this region's outputs
+            for i, t in enumerate(tensors(out)):
+                if t.requires_grad:
+                    t.register_hook(lambda g, i=i: grad_out.setdefault(i, g.detach().clone()))
 
     h = target.register_forward_hook(hook, with_kwargs=True)
-    with torch.no_grad():
-        run_model(entry, model, inputs)
+    if train:
+        train_loss(entry, run_model(entry, model, inputs), inputs).backward()
+        model.zero_grad(set_to_none=True)
+    else:
+        with torch.no_grad():
+            run_model(entry, model, inputs)
     h.remove()
     if "args" not in seen:
-        raise SystemExit(f"{a.module} was not called during the forward pass")
+        raise SystemExit(f"{a.module} was called {len(calls)} time(s); --call {a.call} does not exist")
+    if train:
+        seen["grad_out"] = [grad_out.get(i) for i in range(len(tensors(seen["out"])))]
+        if not any(g is not None for g in seen["grad_out"]):
+            raise SystemExit(f"{a.module}: no gradient reached its outputs in a training step")
 
-    with torch.no_grad():
-        tracer = OpTracer([a.module])
-        with tracer:
+    params = sum(p.numel() * p.element_size() for p in target.parameters())
+    bound = nbytes(seen["args"]) + nbytes(seen["kwargs"]) + nbytes(seen["out"]) + params
+    tracer = OpTracer([a.module])
+    if train:
+        # Trace forward + backward of the region alone: flops/traffic of what a training step runs.
+        gi = set(seen["grad_idx"])
+        cnt = iter(range(10 ** 9))
+        xa, xk = tree_map(lambda t: (t.detach().clone().requires_grad_(True) if next(cnt) in gi else t)
+                          if isinstance(t, torch.Tensor) else t, (seen["args"], seen["kwargs"]))
+        leaves = [t for t in tensors((xa, xk)) if t.requires_grad] + [p for p in target.parameters() if p.requires_grad]
+        with tracer, autocast_ctx(seen["autocast"]):
+            o = tensors(target(*xa, **xk))
+            pairs = [(t, g) for t, g in zip(o, seen["grad_out"]) if g is not None]
+            torch.autograd.grad([t for t, _ in pairs], leaves, [g for _, g in pairs], allow_unused=True)
+        # A perfectly fused fwd+bwd still reads inputs+weights twice, writes outputs, reads grad_out,
+        # writes input grads and weight grads.
+        in_bytes = nbytes(seen["args"]) + nbytes(seen["kwargs"])
+        grad_in = sum(t.numel() * t.element_size() for t in tensors((xa, xk)) if t.requires_grad)
+        bound = 2 * (in_bytes + params) + nbytes(seen["out"]) + nbytes(seen["grad_out"]) + grad_in + params
+    else:
+        with torch.no_grad(), tracer, autocast_ctx(seen["autocast"]):
             target(*seen["args"], **seen["kwargs"])
     flops = sum(o["flops"] for o in tracer.ops)
     eager_bytes = sum(o["bytes"] for o in tracer.ops)
-    params = sum(p.numel() * p.element_size() for p in target.parameters())
-    bound = nbytes(seen["args"]) + nbytes(seen["kwargs"]) + nbytes(seen["out"]) + params
     hw = hw_info()
-    peak_f, peak_b = peaks(hw, compute_dtype(target))
+    peak_f, peak_b = peaks(hw, effective_dtype(target, seen["autocast"]))
     ceil_us = max(flops / peak_f if peak_f else 0, bound / peak_b if peak_b else 0) * 1e6
 
     shapes = lambda x: [(list(t.shape), str(t.dtype).replace("torch.", "")) for t in tensors(x)]  # noqa: E731
@@ -121,10 +159,21 @@ def main() -> None:
             "params_mb": round(params / 1e6, 2), "flops": flops, "boundary_mb": round(bound / 1e6, 2),
             "eager_traffic_mb": round(eager_bytes / 1e6, 2),
             "eager_ops": len([o for o in tracer.ops if not o["view"]]),
-            "ceiling_us": round(ceil_us, 1), "same_class_instances": siblings, "hardware": hw.get("device")}
+            "ceiling_us": round(ceil_us, 1), "same_class_instances": siblings, "hardware": hw.get("device"),
+            "mode": "train" if train else "infer", "grad_inputs": seen["grad_idx"] if train else [],
+            "autocast": seen["autocast"], "captured_call": a.call, "calls": len(calls),
+            "distinct_call_shapes": len(set(calls)),
+            "dropout_disabled": dropout_off}
     write_json(out / "region.json", meta)
     (out / "ORIGINAL.md").write_text(
-        f"# Region {a.module}: {type(target).__qualname__}\n\n"
+        f"# Region {a.module}: {type(target).__qualname__}  (mode: {meta['mode']})\n\n"
+        + (f"TRAINING: impl.forward must be differentiable and return the same gradients for inputs "
+           f"{meta['grad_inputs']} (indices into the inputs list) and every parameter. Triton kernels need a "
+           f"torch.autograd.Function with a backward. flops / boundary / ceiling below are forward + backward.\n\n"
+           if train else "")
+        + (f"AUTOCAST: the model runs this region under torch.autocast({seen['autocast']['dtype']}); bench.py "
+           f"replays it the same way, so optimize the autocast path (matmuls in {seen['autocast']['dtype']}, "
+           f"master weights {str(compute_dtype(target)).replace('torch.', '')}).\n\n" if seen["autocast"] else "") +
         f"inputs: {meta['inputs']}\noutputs: {meta['outputs']}\n"
         f"flops {flops / 1e9:.3f} GFLOP, boundary {meta['boundary_mb']} MB, eager traffic "
         f"{meta['eager_traffic_mb']} MB in {meta['eager_ops']} ops, ceiling {meta['ceiling_us']} us on "
@@ -141,6 +190,11 @@ def main() -> None:
     print(f"captured {a.module} ({type(target).__qualname__}) -> {out}")
     print(f"  {flops / 1e9:.3f} GFLOP, boundary {meta['boundary_mb']} MB, eager {meta['eager_traffic_mb']} MB "
           f"in {meta['eager_ops']} ops, ceiling {meta['ceiling_us']} us")
+    if len(set(calls)) > 1:
+        print(f"  note: {a.module} was called {len(calls)} times with {len(set(calls))} distinct input shapes; "
+              f"captured call {a.call}. Others: --call N; the whole-model check covers all of them")
+    if seen["autocast"]:
+        print(f"  autocast {seen['autocast']['dtype']} recorded; bench.py replays the region under it")
     if siblings:
         print(f"  {len(siblings)} other instances with the same class and shapes: {siblings[:6]} "
               f"(swap.py --all-instances applies your impl to all of them)")

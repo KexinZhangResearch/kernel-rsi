@@ -1,6 +1,6 @@
 # kernel-rsi
 
-**A Claude Code skill that makes PyTorch models faster on *your* GPU, and gets better at it each time it is used.**
+**A Claude Code skill that makes PyTorch models faster on *your* GPU — inference and training (forward + backward) — and gets better at it each time it is used.**
 
 It finds hot regions of a model, which can be a single op or a whole block. It replaces them with
 fused Triton/torch code that computes the same function, checks equivalence on the real model, and
@@ -87,7 +87,21 @@ def build():                       # -> (model on cuda, inputs as a tuple of arg
 
 def run(model, inputs):            # optional; default is model(*inputs) / model(**inputs)
     return model(*inputs)
+
+def shapes():                      # recommended: other inputs the model sees (batch sizes, odd lengths)
+    return [(torch.randn(1, 300, 1152, device="cuda", dtype=torch.bfloat16),)]
+
+MODE = "train"                     # optional: optimize the training step (forward + backward)
+AUTOCAST = "bfloat16"              # optional: the model runs under AMP (do not call autocast in run())
+def loss(out, inputs):             # optional; default: scalar output, else mean of squares
+    return out.float().pow(2).mean()
 ```
+
+With `MODE = "train"`, every tool works on a full training step. The hotspot table splits each
+module's time into forward and backward. `region.py` captures the real upstream gradient. `bench.py`
+and `swap.py` check the gradient of every input and parameter and time forward + backward. They also
+report peak memory, and they re-randomize the weights between checks so stale weight caches fail.
+Dropout is switched off while checking, because random masks cannot be compared.
 
 The tools can also be run by hand:
 
@@ -98,18 +112,27 @@ The tools can also be run by hand:
 | `tools/region.py --entry E --module Q --out DIR` | Freeze a region with its real weights and inputs; create `impl.py` |
 | `tools/bench.py DIR [--compile]` | Check and time `impl.py` against the original (and `torch.compile`) |
 | `tools/swap.py --entry E --impl DIR [--all-instances] [--compile]` | Patch the model; check the whole model; time it end to end |
-| `tools/lessons.py` | Check that every lesson cites an existing result and that the file stays small |
+| `tools/report.py WORK_DIR` | Summarize every attempt (REPORT.md) and export `krsi_patch.py` with `apply(model)` for your code |
+| `tools/replay.py [--regions DIR]` | Re-verify all library kernels (and archived regions) on this machine, no LLM needed |
+| `tools/lessons.py` | Check that lessons cite existing results from the GPU they name; warn about stale torch/triton versions |
 
 ## What "equivalent" and "faster" mean
 
-- **Equivalent.** Outputs are compared against a float32 run of the original. No element may be
+- **Equivalent.** Outputs (and in training mode the loss and all gradients) are compared against a float32 run of the original. No element may be
   further off than 2× the original low-precision model's worst error, and the relative L2 error must be
   within 2× the original's. This is checked on the captured activations and on fresh random inputs,
   first for the region (`bench.py`) and then for the whole model (`swap.py`). On a failure, `bench.py`
   reports which index ranges of which dimension are wrong.
+- **Robust.** A per-row check against the original's error on the same row catches bugs confined to
+  one head or a few tokens, which a tensor-wide budget dilutes. Module buffers such as BatchNorm running
+  stats must match. `shapes()` in `model_entry.py` adds other input shapes, and `swap.py --train-steps N`
+  compares N-step loss curves against the original's own sensitivity to 1-ulp weight noise, so chaotic
+  runs are reported as inconclusive rather than failed. The reference runs in true fp32, with TF32 off
+  for both matmul and cuDNN. Run-to-run nondeterminism is flagged.
 - **Faster.** GPU time per call, measured with CUDA graphs. Inputs and weights rotate through enough
   copies that every call reads cold memory, and the original, `torch.compile` and the replacement are
-  measured the same way. Host-inclusive time is reported as well. Every run is saved as
+  measured the same way, in 5 interleaved rounds. A speedup whose round ranges overlap is reported as
+  "within noise". Host-inclusive time is reported as well. Every run is saved as
   `results/NNN.json` together with a frozen copy of the impl.
 
 ## Self-improvement
@@ -133,26 +156,41 @@ All on an NVIDIA H20-3e (sm_90), bf16, measured with the tools above:
 | DiT block (adaLN, attention with head_dim 72, MLP) | 874 µs | 815 µs | 716 µs | 1.21× |
 | T5 encoder layer (RMSNorm, relative-position-bias attention, GEGLU) | 1336 µs | 893 µs | 592 µs | 2.19× |
 | Pairformer triangle multiplication (N=384, C=128) | 2482 µs | 1321 µs | 485 µs | 4.88× |
+| T5 encoder layer, **training step** (fwd + bwd) | 3796 µs | 5037 µs | 2023 µs eager, 1960 µs compiled (0 graph breaks) | 1.85× eager, 2.58× vs compiled original, −37% peak memory |
 
 These replacements were produced by Claude Opus following this skill; the code and result files are
 not part of this release. Runs driven by other models have not been benchmarked yet.
+
+## Tests
+
+`python -m pytest tests -q` takes about a minute on a GPU. Each check in the tools is tested both ways:
+correct code must pass, and a planted bug must fail. The planted bugs are a localized error, a detached
+weight, BatchNorm stats that never update, a shape-specialized impl, mixed-mode timing, and an AMP
+residual-fold precision loss.
 
 ## Repository layout
 
 ```
 SKILL.md         instructions the agent loads (workflow, principles, rules)
-LESSONS.md       the skill's memory
-tools/           hw, hotspots, region, bench, swap, lessons (+ common helpers)
+LESSONS.md       the skill's memory (checked by tools/lessons.py)
+library/         verified reusable kernels, each with selftest(); replay/ = per-GPU verification results
+tools/           hw, hotspots, region, bench, swap, report, replay, lessons (+ common helpers)
+tests/           pytest suite for the tools
 hardware/        measured GPU profiles
 ```
 
 ## Limitations
 
-- Forward / inference only. Training needs autograd for the replacements, which the tools do not handle.
 - NVIDIA only (CUDA graphs, cuBLAS peaks, ncu). Tested on an H20-3e; on other generations, the code paths
   for missing bf16, tf32 or fp8 and for missing Triton were checked by simulation, not on real cards.
 - Multi-GPU: the tools measure and run on the current device only. Use `CUDA_VISIBLE_DEVICES` to choose it.
-- Caching weight transforms inside an impl is valid only while the weights are frozen.
+- Caching weight transforms inside an impl is valid only for inference (frozen weights).
+- With `--compile`, `bench.py` and `swap.py` also check and time the impl inside a compiled model and
+  report graph breaks. Library kernels are `torch.library.triton_op`s under compile (fullgraph-safe) and
+  plain autograd Functions in eager, where the registered op costs extra host time.
+- Training checks run on a single device. AMP autocast is supported. Gradient scalers, gradient
+  accumulation and distributed training (FSDP/DDP) sit outside the region, so they are not checked.
+  Apply `krsi_patch.apply(model)` before `torch.compile` or FSDP wrapping.
 - The self-improvement works at the level of knowledge: lessons are checked for evidence, but there is
   no automatic A/B test that a lesson helps. To check, rerun an old region from scratch and compare it
   with its earlier result file.

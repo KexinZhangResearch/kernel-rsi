@@ -7,19 +7,25 @@
   "tflops": {
     "fp16": 141.0,
     "bf16": 138.6,
-    "fp32": 25.7,
+    "fp32": 25.8,
     "tf32": 69.7,
-    "fp8": 278.5
+    "fp8": 278.7,
+    "skinny_bf16": {
+      "M16xN4096xK4096": 12.2,
+      "M64xN4096xK4096": 50.3,
+      "M256xN4096xK4096": 106.1,
+      "M1024xN4096xK4096": 113.2
+    }
   },
-  "bw_copy_gbs": 2249,
-  "bw_read_gbs": 2615,
-  "bw_write_gbs": 3380,
+  "bw_copy_gbs": 2247,
+  "bw_read_gbs": 2610,
+  "bw_write_gbs": 3350,
   "ridge_flop_per_byte": {
-    "fp16": 53.9,
-    "bf16": 53.0,
-    "fp32": 9.8,
-    "tf32": 26.6,
-    "fp8": 106.5
+    "fp16": 54.0,
+    "bf16": 53.1,
+    "fp32": 9.9,
+    "tf32": 26.7,
+    "fp8": 106.8
   },
   "default_half_dtype": "bf16",
   "features": {
@@ -32,9 +38,9 @@
   "regs_per_sm": 65536,
   "sm_clock_mhz": 1980,
   "triton": "3.2.0",
-  "launch_us_triton": 18.7,
-  "launch_us_torch": 4.7,
-  "launch_us_graph_replay": 11.2,
+  "launch_us_triton": 18.9,
+  "launch_us_torch": 4.8,
+  "launch_us_graph_replay": 9.9,
   "ncu": "unavailable: /usr/local/cuda/bin/ncu has no counter permission (ERR_NVGPUCTRPERM). Host fix: driver option NVreg_RestrictProfilingToAdminUsers=0, or run the container with --cap-add SYS_ADMIN",
   "torch": "2.6.0+cu124"
 }
